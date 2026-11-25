@@ -105,6 +105,8 @@ fn classify(class: Option<u32>, name: &str) -> Role {
 
 /// Runs the setup wizard.
 pub async fn run(cli: &Cli, reauth: bool, install_bluez_dropin: bool) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve the running Seuil executable")?;
+    let unit = unit_text(&executable)?;
     println!("Seuil setup");
     if !command_available("bluetoothctl") {
         println!(
@@ -169,7 +171,7 @@ pub async fn run(cli: &Cli, reauth: bool, install_bluez_dropin: bool) -> Result<
     println!("\nWrote {}", config_path.display());
 
     report_optional_tools();
-    install_service()?;
+    install_service(&unit)?;
     println!("Installed and started {SERVICE}");
     print_bluez_dropin(install_bluez_dropin)?;
     println!("Check the connection with: journalctl --user -u {SERVICE} -f");
@@ -270,21 +272,12 @@ async fn prompt_index(label: &str, suggested: Option<usize>, len: usize) -> Resu
 }
 
 /// Writes the systemd user unit and enables it.
-fn install_service() -> Result<()> {
+fn install_service(unit: &str) -> Result<()> {
     let unit_path = unit_path()?;
     if let Some(parent) = unit_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    write_atomic(&unit_path, unit_text().as_bytes(), 0o644)?;
-
-    let bin = home_dir()?.join(".local/bin/seuil");
-    if !bin.exists() {
-        println!(
-            "warning: {} is missing; run ./install.sh first",
-            bin.display()
-        );
-    }
+    write_atomic(&unit_path, unit.as_bytes(), 0o644)?;
 
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "enable", SERVICE])?;
@@ -308,22 +301,36 @@ pub fn unit_path() -> Result<PathBuf> {
 /// such as `bluetooth.target`, and `PartOf=graphical-session.target` would stop
 /// the daemon on a Gaming Mode to Desktop Mode switch.
 /// `WantedBy=default.target` starts it on a pure Gaming Mode boot.
-pub fn unit_text() -> String {
-    "[Unit]\n\
+fn unit_text(executable: &Path) -> Result<String> {
+    let path = executable
+        .to_str()
+        .with_context(|| format!("Seuil executable path is not valid UTF-8: {executable:?}"))?;
+    // systemd rejects these characters in the executable even after unquoting.
+    anyhow::ensure!(
+        !path.bytes().any(|byte| {
+            byte.is_ascii_control() || matches!(byte, b'"' | b'\'' | b'\\' | b'*' | b'?' | b'[')
+        }),
+        "systemd cannot use this Seuil executable path: {executable:?}"
+    );
+    let path = path.replace('%', "%%");
+    // Quote the executable as one word and disable $ expansion with `:`.
+    Ok(format!(
+        "[Unit]\n\
          Description=Seuil Samsung Continuity daemon (Galaxy Buds Auto Switch)\n\
          After=pipewire.service\n\
          Wants=pipewire.service\n\
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart=%h/.local/bin/seuil\n\
+         ExecStart=:\"{path}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          Environment=RUST_LOG=info\n\
          ExecStartPre=-/usr/bin/bluetoothctl show\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n".to_string()
+         WantedBy=default.target\n"
+    ))
 }
 
 /// Prints the optional BlueZ drop-in and installs it only when asked. [FR-005]
@@ -480,12 +487,6 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,11 +509,26 @@ mod tests {
     }
 
     #[test]
-    fn unit_starts_the_rebranded_binary() {
-        let unit = unit_text();
-        assert!(unit.contains("ExecStart=%h/.local/bin/seuil"));
-        assert!(unit.contains("After=pipewire.service"));
-        assert!(!unit.contains("bluetooth.target"));
-        assert!(!unit.contains("graphical-session.target"));
+    fn unit_starts_the_executable_used_for_setup() {
+        for path in ["/usr/bin/seuil", "/home/desktop/.local/bin/seuil"] {
+            let unit = unit_text(Path::new(path)).unwrap();
+            let exec_start = format!("ExecStart=:\"{path}\"");
+            assert!(unit.lines().any(|line| line == exec_start));
+            assert!(unit.contains("After=pipewire.service"));
+            assert!(!unit.contains("bluetooth.target"));
+            assert!(!unit.contains("graphical-session.target"));
+        }
+    }
+
+    #[test]
+    fn unit_quotes_spaces_and_leaves_specifiers_and_dollars_literal() {
+        let unit = unit_text(Path::new("/home/Desktop User/100%/${BIN}/seuil")).unwrap();
+        let exec_start = "ExecStart=:\"/home/Desktop User/100%%/${BIN}/seuil\"";
+        assert!(unit.lines().any(|line| line == exec_start));
+    }
+
+    #[test]
+    fn unit_rejects_a_path_systemd_cannot_execute() {
+        assert!(unit_text(Path::new("/home/Desktop\nUser/seuil")).is_err());
     }
 }
