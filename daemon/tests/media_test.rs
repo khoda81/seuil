@@ -51,15 +51,15 @@ fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// A probe script that always reports one RUNNING playback stream.
-fn always_running_probe(dir: &std::path::Path, role: &str, class: &str) -> PathBuf {
+/// A probe script that always reports one uncorked playback stream.
+fn uncorked_probe(dir: &std::path::Path, role: &str, class: &str) -> PathBuf {
     write_script(
         dir,
         "probe",
         &format!(
             r#"cat <<'EOF'
 Sink Input #7
-	State: RUNNING
+	Corked: no
 	Mute: no
 	Volume: front-left: 65536 / 100% / 0.00 dB
 	Properties:
@@ -147,7 +147,7 @@ async fn collect(rx: &mut tokio::sync::mpsc::Receiver<MediaEvent>, duration: Dur
 async fn silent_running_stream_never_becomes_activity() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = scratch_dir("silent");
-    let probe = always_running_probe(&dir, "music", "Stream/Output/Audio");
+    let probe = uncorked_probe(&dir, "music", "Stream/Output/Audio");
     let tap = trigger_tap(&dir); // trigger never created: silent throughout
     let (mut rx, started) = start_monitor(&probe, &tap, default_settings());
     let events = collect(&mut rx, Duration::from_millis(1600)).await;
@@ -169,7 +169,7 @@ async fn silent_running_stream_never_becomes_activity() {
 async fn stream_change_to_loud_settles_within_one_second_exactly_once() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = scratch_dir("latency");
-    let probe = always_running_probe(&dir, "music", "Stream/Output/Audio");
+    let probe = uncorked_probe(&dir, "music", "Stream/Output/Audio");
     let tap = trigger_tap(&dir);
     let (mut rx, _) = start_monitor(&probe, &tap, default_settings());
 
@@ -204,6 +204,69 @@ async fn stream_change_to_loud_settles_within_one_second_exactly_once() {
     );
 }
 
+#[tokio::test]
+async fn empty_tap_reads_hold_activity_until_measured_silence() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = scratch_dir("bursts");
+    let probe = uncorked_probe(&dir, "music", "Stream/Output/Audio");
+    let tap = write_script(
+        &dir,
+        "tap",
+        // 38,400 bytes is 200 ms at 48 kHz stereo s16le.
+        r#"head -c 38400 /dev/zero | tr '\000' '\177'
+sleep 1.5
+head -c 38400 /dev/zero
+sleep 5
+"#,
+    );
+    let (mut rx, _) = start_monitor(&probe, &tap, default_settings());
+
+    let started = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("the loud PCM must start activity");
+    assert!(matches!(started, Some(MediaEvent::AudioStarted { .. })));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(700), rx.recv())
+            .await
+            .is_err(),
+        "empty reads must leave the last verdict intact"
+    );
+    let stopped = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("enough silent PCM must stop activity");
+    assert!(matches!(stopped, Some(MediaEvent::AudioStopped { .. })));
+}
+
+#[tokio::test]
+async fn stalled_tap_leaves_capacity_for_other_playback() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = scratch_dir("tap-failure");
+    let probe = write_script(
+        &dir,
+        "probe",
+        r#"for index in 7 8 9 10 11; do
+    printf 'Sink Input #%s\n\tCorked: no\n\tMute: no\n' "$index"
+done
+"#,
+    );
+    let tap = write_script(
+        &dir,
+        "tap",
+        r#"case "$1" in
+    7) exec sleep 4 ;;
+    11) tr '\000' '\177' < /dev/zero ;;
+    *) cat /dev/zero ;;
+esac
+"#,
+    );
+    let (mut rx, _) = start_monitor(&probe, &tap, default_settings());
+    let events = collect(&mut rx, Duration::from_secs(1)).await;
+    assert!(
+        matches!(events.as_slice(), [MediaEvent::AudioStarted { .. }]),
+        "the loud stream must be heard after the stalled tap frees a slot, got {events:?}"
+    );
+}
+
 // [FR-016 | spec-media-activity-filtering Requirement 1 Scenario "Voice chat"]
 // GIVEN a communication-class stream, WHEN the monitor evaluates it, THEN it
 // does not count as media activity even when its peak clears the threshold.
@@ -211,7 +274,7 @@ async fn stream_change_to_loud_settles_within_one_second_exactly_once() {
 async fn communication_role_stream_is_excluded() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = scratch_dir("comm");
-    let probe = always_running_probe(&dir, "phone", "Stream/Output/Audio");
+    let probe = uncorked_probe(&dir, "phone", "Stream/Output/Audio");
     let tap = trigger_tap(&dir);
     std::fs::write(dir.join("loud"), b"1").unwrap(); // loud from the start
     let (mut rx, _) = start_monitor(&probe, &tap, default_settings());
@@ -227,7 +290,7 @@ async fn communication_role_stream_is_excluded() {
 async fn capture_class_stream_is_excluded() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = scratch_dir("capture");
-    let probe = always_running_probe(&dir, "music", "Stream/Input/Audio");
+    let probe = uncorked_probe(&dir, "music", "Stream/Input/Audio");
     let tap = trigger_tap(&dir);
     std::fs::write(dir.join("loud"), b"1").unwrap();
     let (mut rx, _) = start_monitor(&probe, &tap, default_settings());
@@ -246,7 +309,7 @@ async fn capture_class_stream_is_excluded() {
 async fn custom_threshold_is_honored_over_the_default() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = scratch_dir("threshold");
-    let probe = always_running_probe(&dir, "music", "Stream/Output/Audio");
+    let probe = uncorked_probe(&dir, "music", "Stream/Output/Audio");
     let tap = quiet_tap(&dir); // peak around -26 dBFS
 
     // Custom settings: threshold above the tap peak.
@@ -264,7 +327,7 @@ async fn custom_threshold_is_honored_over_the_default() {
 
     // Default settings on the same tap: the same peak clears -60 dBFS.
     let dir2 = scratch_dir("threshold-default");
-    let probe2 = always_running_probe(&dir2, "music", "Stream/Output/Audio");
+    let probe2 = uncorked_probe(&dir2, "music", "Stream/Output/Audio");
     let (mut rx2, _) = start_monitor(&probe2, &tap, MediaSettings::default());
     let event = tokio::time::timeout(Duration::from_secs(6), rx2.recv())
         .await
@@ -311,7 +374,7 @@ if [ "$elapsed" -lt 2 ]; then
     sleep 5
 fi
 echo 'Sink Input #7'
-echo '	State: RUNNING'
+echo '	Corked: no'
 echo '	Properties:'
 echo '		media.role = "music"'
 echo '		media.class = "Stream/Output/Audio"'
@@ -367,7 +430,7 @@ if [ "$elapsed" -ge 1 ] && [ "$elapsed" -lt 3 ]; then
     exit 1
 fi
 echo 'Sink Input #7'
-echo '	State: RUNNING'
+echo '	Corked: no'
 echo '	Properties:'
 echo '		media.role = "music"'
 echo '		media.class = "Stream/Output/Audio"'

@@ -62,7 +62,7 @@ pub struct FileConfig {
     /// Peak floor in dBFS for media activity. [FR-016]
     #[serde(default = "default_media_threshold_dbfs")]
     pub media_threshold_dbfs: i32,
-    /// Time the peak must stay above the floor, in milliseconds. [FR-016]
+    /// Measured PCM duration to confirm a change, in milliseconds. [FR-016]
     #[serde(default = "default_media_window_ms")]
     pub media_window_ms: u64,
 }
@@ -159,7 +159,7 @@ impl FileConfig {
         self.media_threshold_dbfs as f32
     }
 
-    /// Window the peak must stay above the floor. [FR-016]
+    /// Measured PCM duration to confirm an activity change. [FR-016]
     pub fn media_window(&self) -> Duration {
         Duration::from_millis(self.media_window_ms.max(1))
     }

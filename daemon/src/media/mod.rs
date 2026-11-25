@@ -1,8 +1,8 @@
 //! Media integration: PipeWire audio activity detection and MPRIS control
 //!
-//! [FR-016] A stream counts as active only while it is RUNNING with its peak
-//! above the configured threshold across the configured window. Capture-side
-//! and communication-class streams are excluded.
+//! [FR-016] An uncorked, unmuted media stream changes activity after enough
+//! recorded PCM is consistently above or below the configured peak threshold.
+//! Capture-side and communication-class streams are excluded.
 //!
 //! [FR-018] Every probe is timeout-bounded. A failed or missing probe holds
 //! the last known activity state and logs one persistent warning instead of
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::future::join_all;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -23,8 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Duration bound on one probe subprocess. [FR-018]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Poll period. Two samples fit inside the default 200 ms window, and a state
-/// change settles well inside NFR-001's one-second bound. [NFR-001]
+/// Period for reconciling the stream listing and draining the taps. [NFR-001]
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Delay before the supervisor restarts a monitor task that died. [FR-018]
@@ -33,22 +33,30 @@ const SUPERVISOR_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Upper bound on simultaneous stream taps.
 ///
 /// Each tap is one `parec` subprocess, so the bound keeps a stream flood from
-/// exhausting subprocesses. Existing taps and the first RUNNING candidates are
+/// exhausting subprocesses. Existing taps and the first eligible streams are
 /// preferred when the bound is reached. [FR-016]
 const MAX_TAPS: usize = 4;
 
-/// Largest block read from one tap per poll. A 48 kHz stereo s16 stream
-/// produces about 19 KB per 100 ms poll, so this drains the pipe with headroom.
-const TAP_READ_BYTES: usize = 32 * 1024;
-
-/// Duration bound on one tap read. [FR-018]
+/// Time budget for draining each tap per poll. [FR-018]
 const TAP_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
-/// Sample rate the tap requests from `parec`. [FR-016]
-const TAP_SAMPLE_RATE: u32 = 48_000;
+/// Give other eligible streams a slot before retrying a failed tap.
+const TAP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Channel count the tap requests from `parec`. [FR-016]
-const TAP_CHANNELS: u32 = 2;
+/// Reclaim a slot under contention after five polls without a fragment.
+/// With the requested latency, the measured A2DP tap delivered its first
+/// fragment within 100 ms.
+const TAP_STARTUP_GRACE: Duration = Duration::from_millis(500);
+
+const TAP_SAMPLE_RATE: usize = 48_000;
+const TAP_CHANNELS: usize = 2;
+/// The default parec fragment can take two seconds to arrive. Request 40 ms
+/// fragments (7,680 bytes) so a typical 8 KiB pipe can fit an entire fragment.
+const TAP_FRAGMENT_MS: u64 = 40;
+const TAP_FRAGMENT_BYTES: usize =
+    TAP_SAMPLE_RATE * TAP_CHANNELS * size_of::<i16>() * TAP_FRAGMENT_MS as usize / 1_000;
+/// Drain up to 160 ms of PCM per 100 ms poll, bounded even if the pipe is full.
+const TAP_FRAGMENTS_PER_POLL: usize = 4;
 
 /// Media state event
 #[allow(dead_code)] // Fields describe the source in logs.
@@ -68,7 +76,7 @@ pub enum MediaEvent {
 pub struct MediaSettings {
     /// Minimum peak in dBFS for a stream to count as active.
     pub threshold_dbfs: f32,
-    /// Time the peak must stay above the threshold.
+    /// Duration of measured PCM required above or below the threshold.
     pub window: Duration,
     /// Bound on one probe. [FR-018]
     pub probe_timeout: Duration,
@@ -86,25 +94,23 @@ impl Default for MediaSettings {
 
 /// One PipeWire playback stream as reported by `pactl list sink-inputs`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StreamSample {
+struct StreamSample {
     /// Sink-input index, the handle the peak tap records. [FR-016]
-    pub index: u32,
-    pub state_running: bool,
-    pub corked: bool,
-    pub muted: bool,
+    index: u32,
+    corked: bool,
+    muted: bool,
     /// Largest channel gain as a linear factor; 1.0 is unity (0 dBFS).
     /// Diagnostic only: activity is decided by the measured peak.
-    pub volume: f32,
-    pub media_class: String,
-    pub media_role: String,
+    volume: f32,
+    media_class: String,
+    media_role: String,
 }
 
 impl Default for StreamSample {
     fn default() -> Self {
         Self {
             index: 0,
-            state_running: false,
-            corked: false,
+            corked: true,
             muted: false,
             volume: 1.0,
             media_class: String::new(),
@@ -115,7 +121,7 @@ impl Default for StreamSample {
 
 impl StreamSample {
     /// Linear gain expressed in dBFS. Unity gain is 0 dBFS.
-    pub fn gain_dbfs(&self) -> f32 {
+    fn gain_dbfs(&self) -> f32 {
         if self.volume <= 0.0 {
             f32::NEG_INFINITY
         } else {
@@ -127,7 +133,7 @@ impl StreamSample {
     ///
     /// Capture-side sources and communication-class roles are never media
     /// activity. [FR-016]
-    pub fn is_media_stream(&self) -> bool {
+    fn is_media_stream(&self) -> bool {
         let class = self.media_class.to_ascii_lowercase();
         let capture = class.contains("/input")
             || class.contains("capture")
@@ -144,35 +150,36 @@ impl StreamSample {
     /// This never decides activity on its own; the verdict comes from the peak
     /// the tap measures. Capture-side sources and communication-class roles
     /// are never media activity. [FR-016]
-    pub fn is_tap_candidate(&self) -> bool {
-        self.state_running && !self.corked && !self.muted && self.is_media_stream()
-    }
-
-    /// True when a tapped stream's true peak is at or above the threshold.
-    ///
-    /// [FR-016] The session gain is not a dBFS ceiling: a digitally-silent
-    /// stream at unity gain stays inactive, and a stream whose peak clears the
-    /// threshold is active regardless of its gain.
-    pub fn is_active_with_peak(&self, peak_dbfs: f32, threshold_dbfs: f32) -> bool {
-        self.is_tap_candidate() && peak_dbfs >= threshold_dbfs
+    fn is_tap_candidate(&self) -> bool {
+        !self.corked && !self.muted && self.is_media_stream()
     }
 }
 
-/// Tracks how long the peak has stayed above the threshold. [FR-016]
+/// Confirms a change from successive measured PCM blocks on one stream.
+/// A gap in delivery leaves the verdict and the evidence so far intact.
 #[derive(Debug, Default)]
 struct ActivityWindow {
-    above_since: Option<Instant>,
+    confirmed: Option<bool>,
+    pending: Option<(bool, Duration)>,
 }
 
 impl ActivityWindow {
-    /// Returns true once the active condition has held for at least `window`.
-    fn update(&mut self, above_threshold: bool, now: Instant, window: Duration) -> bool {
-        if !above_threshold {
-            self.above_since = None;
-            return false;
+    fn observe(&mut self, above: bool, window: Duration) {
+        if self.confirmed == Some(above) {
+            self.pending = None;
+            return;
         }
-        let since = *self.above_since.get_or_insert(now);
-        now.duration_since(since) >= window
+        let fragment = Duration::from_millis(TAP_FRAGMENT_MS);
+        let observed = match self.pending {
+            Some((value, duration)) if value == above => duration + fragment,
+            _ => fragment,
+        };
+        if window <= observed {
+            self.confirmed = Some(above);
+            self.pending = None;
+        } else {
+            self.pending = Some((above, observed));
+        }
     }
 }
 
@@ -193,7 +200,7 @@ const PROBE_COMMAND_ENV: &str = "SEUIL_MEDIA_PROBE";
 const TAP_COMMAND_ENV: &str = "SEUIL_MEDIA_TAP";
 
 /// Why the activity probe produced no result. [FR-018]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ProbeFailure {
     MissingTool(&'static str),
     TimedOut(Duration),
@@ -257,63 +264,43 @@ async fn run_monitor(
         "Starting the PipeWire activity monitor"
     );
 
-    let mut window = ActivityWindow::default();
-    let mut taps = TapPool::new();
+    let mut taps = TapPool::default();
     let mut probe_healthy = true;
+    let mut poll = tokio::time::interval(POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let sampled_at = Instant::now();
-        match evaluate_activity(&mut taps, &settings).await {
-            Ok(above) => {
-                if !probe_healthy {
-                    info!("The PipeWire activity probe recovered");
-                    probe_healthy = true;
-                }
-                let active = window.update(above, sampled_at, settings.window);
-                if active != last_active.load(Ordering::Relaxed) {
-                    last_active.store(active, Ordering::Relaxed);
-                    let event = if active {
-                        MediaEvent::AudioStarted {
-                            stream_name: "pipewire".into(),
-                        }
-                    } else {
-                        MediaEvent::AudioStopped {
-                            stream_name: "pipewire".into(),
-                        }
-                    };
-                    if tx.send(event).await.is_err() {
-                        return true;
-                    }
-                }
+        poll.tick().await;
+        let (observation, failure) = taps.evaluate_activity(&settings).await;
+        match failure {
+            Some(failure) if probe_healthy => {
+                warn!(reason = %failure, "PipeWire activity measurement is degraded");
+                probe_healthy = false;
             }
-            Err(failure) => {
-                // [FR-018] Hold the last known state. The window is frozen, not
-                // reset, so a recovered probe cannot turn one continuous state
-                // into a stop/start edge pair.
-                if probe_healthy {
-                    probe_healthy = false;
-                    warn!(
-                        reason = %failure,
-                        "The PipeWire activity probe failed; holding the last known state"
-                    );
+            None if !probe_healthy => {
+                info!("The PipeWire activity probe recovered");
+                probe_healthy = true;
+            }
+            _ => {}
+        }
+        if let Some(active) = observation
+            && active != last_active.load(Ordering::Relaxed)
+        {
+            last_active.store(active, Ordering::Relaxed);
+            let event = if active {
+                MediaEvent::AudioStarted {
+                    stream_name: "pipewire".into(),
                 }
+            } else {
+                MediaEvent::AudioStopped {
+                    stream_name: "pipewire".into(),
+                }
+            };
+            if tx.send(event).await.is_err() {
+                return true;
             }
         }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-/// Lists the streams, then measures the true peak of each tapped stream.
-///
-/// [FR-016] The activity verdict is peak-based: a stream counts only when its
-/// measured peak stays above the threshold across the window.
-async fn evaluate_activity(
-    taps: &mut TapPool,
-    settings: &MediaSettings,
-) -> std::result::Result<bool, ProbeFailure> {
-    let streams = probe_sink_inputs(settings.probe_timeout).await?;
-    taps.is_active(&streams, settings).await
 }
 
 /// Runs the activity probe with a timeout. [FR-018]
@@ -332,7 +319,7 @@ async fn probe_sink_inputs(
             command
         }
     };
-    let output = tokio::time::timeout(timeout, command.output())
+    let output = tokio::time::timeout(timeout, command.kill_on_drop(true).output())
         .await
         .map_err(|_| ProbeFailure::TimedOut(timeout))?
         .map_err(|error| match error.kind() {
@@ -370,8 +357,8 @@ fn parse_sink_inputs(text: &str) -> Vec<StreamSample> {
             if let Some(sample) = current.take() {
                 samples.push(sample);
             }
-            current = Some(StreamSample {
-                index: value.trim().parse().unwrap_or(0),
+            current = value.trim().parse().ok().map(|index| StreamSample {
+                index,
                 ..StreamSample::default()
             });
             continue;
@@ -380,10 +367,9 @@ fn parse_sink_inputs(text: &str) -> Vec<StreamSample> {
             continue;
         };
 
-        if let Some(value) = trimmed.strip_prefix("State:") {
-            sample.state_running = value.trim().eq_ignore_ascii_case("RUNNING");
-        } else if let Some(value) = trimmed.strip_prefix("Corked:") {
-            sample.corked = value.trim().eq_ignore_ascii_case("yes");
+        // Sink inputs expose Corked, while State belongs to the sink.
+        if let Some(value) = trimmed.strip_prefix("Corked:") {
+            sample.corked = !value.trim().eq_ignore_ascii_case("no");
         } else if let Some(value) = trimmed.strip_prefix("Mute:") {
             sample.muted = value.trim().eq_ignore_ascii_case("yes");
         } else if let Some(value) = trimmed.strip_prefix("Volume:") {
@@ -424,60 +410,68 @@ fn unquote(value: &str) -> String {
 
 /// Owns the live peak taps and reconciles them with the stream listing.
 ///
-/// [FR-016] One tap records one playback stream. Taps open for the first
-/// RUNNING candidates up to [`MAX_TAPS`], survive across polls, and close when
-/// their stream leaves the listing or stops being a candidate.
+/// [FR-016] Taps survive across polls and close when their stream leaves the
+/// listing, is corked, or is muted.
+#[derive(Default)]
 struct TapPool {
-    taps: HashMap<u32, StreamTap>,
+    streams: HashMap<u32, MonitoredStream>,
     cap_logged: bool,
 }
 
 impl TapPool {
-    fn new() -> Self {
-        Self {
-            taps: HashMap::new(),
-            cap_logged: false,
-        }
-    }
-
-    /// Reconciles taps with the listing and returns whether any tapped stream
-    /// is currently above the configured peak threshold. [FR-016]
-    async fn is_active(
+    /// Returns the verdict and any failure affecting how much was measured.
+    async fn evaluate_activity(
         &mut self,
-        streams: &[StreamSample],
         settings: &MediaSettings,
-    ) -> std::result::Result<bool, ProbeFailure> {
+    ) -> (Option<bool>, Option<ProbeFailure>) {
+        let streams = match probe_sink_inputs(settings.probe_timeout).await {
+            Ok(streams) => streams,
+            Err(failure) => {
+                // Keep the verdicts. Discard buffered PCM from before the outage.
+                for stream in self.streams.values_mut() {
+                    stream.tap = TapStatus::Closed;
+                    stream.activity.pending = None;
+                }
+                return (None, Some(failure));
+            }
+        };
         let candidates: Vec<&StreamSample> = streams
             .iter()
             .filter(|stream| stream.is_tap_candidate())
             .collect();
         let candidate_indices: HashSet<u32> =
             candidates.iter().map(|stream| stream.index).collect();
+        let had_active_stream = self.streams.values().any(MonitoredStream::is_active);
 
-        // Existing taps stay while their stream is still a candidate; the rest
-        // are killed and dropped so no subprocess outlives its stream.
-        self.taps.retain(|index, tap| {
-            if candidate_indices.contains(index) {
-                true
-            } else {
-                tap.close();
-                false
-            }
-        });
+        self.streams
+            .retain(|index, _| candidate_indices.contains(index));
+        let mut open_taps = self
+            .streams
+            .values()
+            .filter(|stream| matches!(stream.tap, TapStatus::Open(_)))
+            .count();
+        let now = Instant::now();
 
-        // Fill the remaining slots in listing order, so already-tapped streams
-        // and the first RUNNING candidates win under a flood.
-        for stream in &candidates {
-            if self.taps.len() >= MAX_TAPS {
+        for candidate in &candidates {
+            if open_taps == MAX_TAPS {
                 break;
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.taps.entry(stream.index)
-            {
-                entry.insert(StreamTap::spawn(stream)?);
+            let stream = self.streams.entry(candidate.index).or_default();
+            match &stream.tap {
+                TapStatus::Open(_) => continue,
+                TapStatus::Retry { after, .. } if now < *after => continue,
+                _ => {}
+            }
+            match StreamTap::spawn(candidate) {
+                Ok(tap) => {
+                    stream.tap = TapStatus::Open(Box::new(tap));
+                    open_taps += 1;
+                }
+                Err(failure) => stream.failed(failure),
             }
         }
 
-        let capped = candidates.len() > self.taps.len();
+        let capped = open_taps == MAX_TAPS && MAX_TAPS < candidates.len();
         if capped {
             if !self.cap_logged {
                 debug!(
@@ -491,41 +485,93 @@ impl TapPool {
             self.cap_logged = false;
         }
 
-        let indices: Vec<u32> = self.taps.keys().copied().collect();
-        let mut above = false;
-        for index in indices {
-            let peak = match self.taps.get_mut(&index) {
-                Some(tap) => tap.sample_peak_dbfs().await,
-                None => continue,
-            };
-            match peak {
-                Ok(peak) => {
-                    if let Some(stream) = streams.iter().find(|stream| stream.index == index) {
-                        above |= stream.is_active_with_peak(peak, settings.threshold_dbfs);
-                    }
-                }
-                Err(failure) => {
-                    // [FR-018] A failing tap holds the last known state. Drop it
-                    // so the next tick can respawn it and recover.
-                    if let Some(mut tap) = self.taps.remove(&index) {
-                        tap.close();
-                    }
-                    return Err(failure);
-                }
-            }
+        // One read budget for all the taps, even when several pipes are empty.
+        join_all(
+            self.streams
+                .iter_mut()
+                .map(|(&index, stream)| stream.sample(index, settings, capped)),
+        )
+        .await;
+
+        let activity = if self.streams.values().any(MonitoredStream::is_active) {
+            Some(true)
+        } else if had_active_stream
+            || candidates.is_empty()
+            || self
+                .streams
+                .values()
+                .all(|stream| stream.activity.confirmed == Some(false))
+        {
+            Some(false)
+        } else {
+            None
+        };
+        let failure = self.streams.values().find_map(|stream| match &stream.tap {
+            TapStatus::Retry { failure, .. } => Some(failure.clone()),
+            _ => None,
+        });
+        (activity, failure)
+    }
+}
+
+/// Playback evidence belongs to the sink input across recorder restarts.
+#[derive(Default)]
+struct MonitoredStream {
+    activity: ActivityWindow,
+    tap: TapStatus,
+}
+
+#[derive(Default)]
+enum TapStatus {
+    #[default]
+    Closed,
+    Open(Box<StreamTap>),
+    Retry {
+        after: Instant,
+        failure: ProbeFailure,
+    },
+}
+
+impl MonitoredStream {
+    fn is_active(&self) -> bool {
+        self.activity.confirmed == Some(true)
+    }
+
+    fn failed(&mut self, failure: ProbeFailure) {
+        self.tap = TapStatus::Retry {
+            after: Instant::now() + TAP_RETRY_DELAY,
+            failure,
+        };
+        self.activity.pending = None;
+    }
+
+    async fn sample(&mut self, index: u32, settings: &MediaSettings, capped: bool) {
+        let TapStatus::Open(tap) = &mut self.tap else {
+            return;
+        };
+        if let Err(error) = tap.sample_activity(&mut self.activity, settings).await {
+            self.failed(ProbeFailure::Failed(format!(
+                "stream tap #{index}: {error}"
+            )));
+        } else if capped
+            && tap
+                .first_fragment_due
+                .is_some_and(|due| due <= Instant::now())
+        {
+            self.failed(ProbeFailure::Failed(format!(
+                "stream tap #{index} produced no PCM in {TAP_STARTUP_GRACE:?}"
+            )));
         }
-        Ok(above)
     }
 }
 
 /// One live `parec` tap over a playback stream.
 struct StreamTap {
-    index: u32,
-    child: tokio::process::Child,
-    stdout: Option<tokio::process::ChildStdout>,
-    read_buf: Vec<u8>,
-    /// Bytes that did not complete an s16 sample on the previous read.
-    pending: Vec<u8>,
+    _child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    fragment: Vec<u8>,
+    filled: usize,
+    first_fragment_due: Option<Instant>,
 }
 
 impl StreamTap {
@@ -541,59 +587,54 @@ impl StreamTap {
             std::io::ErrorKind::NotFound => ProbeFailure::MissingTool(tool),
             _ => ProbeFailure::Failed(error.to_string()),
         })?;
-        let stdout = child.stdout.take();
+        let stdout = child
+            .stdout
+            .take()
+            .expect("the stream tap's stdout is piped");
         debug!(
             stream_index = stream.index,
             gain_dbfs = stream.gain_dbfs(),
             "Opened a stream tap"
         );
         Ok(Self {
-            index: stream.index,
-            child,
+            _child: child,
             stdout,
-            read_buf: vec![0u8; TAP_READ_BYTES],
-            pending: Vec::new(),
+            fragment: vec![0; TAP_FRAGMENT_BYTES],
+            filled: 0,
+            first_fragment_due: Some(Instant::now() + TAP_STARTUP_GRACE),
         })
     }
 
-    /// Reads the samples that arrived since the last poll and returns their
-    /// peak in dBFS. [FR-016]
-    async fn sample_peak_dbfs(&mut self) -> std::result::Result<f32, ProbeFailure> {
-        let Some(stdout) = self.stdout.as_mut() else {
-            return Err(ProbeFailure::Failed(
-                "the stream tap has no output pipe".into(),
-            ));
-        };
-        let read =
-            match tokio::time::timeout(TAP_READ_TIMEOUT, stdout.read(&mut self.read_buf)).await {
-                Ok(Ok(0)) => {
-                    return Err(ProbeFailure::Failed(format!(
-                        "the stream tap for #{} closed its output",
-                        self.index
-                    )));
+    /// A partial read stays in the buffer for the next poll. Only complete PCM
+    /// blocks provide timing evidence, regardless of how the pipe splits them.
+    async fn sample_activity(
+        &mut self,
+        activity: &mut ActivityWindow,
+        settings: &MediaSettings,
+    ) -> std::io::Result<()> {
+        tokio::time::timeout(TAP_READ_TIMEOUT, async {
+            for _ in 0..TAP_FRAGMENTS_PER_POLL {
+                while self.filled < self.fragment.len() {
+                    let read = self.stdout.read(&mut self.fragment[self.filled..]).await?;
+                    if read == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "the tap closed its output",
+                        ));
+                    }
+                    self.filled += read;
                 }
-                Ok(Ok(read)) => read,
-                Ok(Err(error)) => return Err(ProbeFailure::Failed(error.to_string())),
-                // No samples within the budget is silence, not a failure.
-                Err(_) => 0,
-            };
-        self.pending.extend_from_slice(&self.read_buf[..read]);
-        let complete = self.pending.len() - self.pending.len() % 2;
-        let peak = peak_dbfs(&self.pending[..complete]);
-        self.pending.drain(..complete);
-        Ok(peak)
-    }
-
-    /// Stops the tap. `kill_on_drop` covers the drop path; this closes early.
-    fn close(&mut self) {
-        self.stdout.take();
-        if let Err(error) = self.child.start_kill() {
-            debug!(
-                stream_index = self.index,
-                %error,
-                "Could not stop the stream tap"
-            );
-        }
+                activity.observe(
+                    settings.threshold_dbfs <= peak_dbfs(&self.fragment),
+                    settings.window,
+                );
+                self.filled = 0;
+                self.first_fragment_due = None;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -615,6 +656,7 @@ fn tap_command(index: u32) -> (tokio::process::Command, &'static str) {
                 "--format=s16le".to_string(),
                 format!("--rate={TAP_SAMPLE_RATE}"),
                 format!("--channels={TAP_CHANNELS}"),
+                format!("--latency-msec={TAP_FRAGMENT_MS}"),
             ]);
             (command, "parec")
         }
@@ -722,12 +764,10 @@ impl MprisController {
 mod tests {
     use super::*;
 
-    fn sample(state_running: bool, muted: bool, volume: f32) -> StreamSample {
+    fn sample() -> StreamSample {
         StreamSample {
             index: 1,
-            state_running,
-            muted,
-            volume,
+            corked: false,
             media_class: "Stream/Output/Audio".into(),
             media_role: "Music".into(),
             ..StreamSample::default()
@@ -735,39 +775,19 @@ mod tests {
     }
 
     #[test]
-    fn muted_stream_is_not_active() {
-        let muted = sample(true, true, 1.0);
-        assert!(!muted.is_tap_candidate());
-        assert!(!muted.is_active_with_peak(0.0, -60.0));
-    }
-
-    #[test]
-    fn silent_peak_is_not_active() {
-        // [FR-016] Unity session gain does not make a digitally-silent stream
-        // active; the measured peak decides.
-        let stream = sample(true, false, 1.0);
-        assert!(stream.is_tap_candidate());
-        assert!(!stream.is_active_with_peak(f32::NEG_INFINITY, -60.0));
-        assert!(!stream.is_active_with_peak(-61.0, -60.0));
-        assert!(stream.is_active_with_peak(-60.0, -60.0));
-        assert!(stream.is_active_with_peak(-6.0, -60.0));
-    }
-
-    #[test]
-    fn tap_candidates_require_a_playable_stream() {
-        // [FR-016] The cheap gates decide which streams get a tap, not activity.
-        let running = sample(true, false, 1.0);
-        assert!(running.is_tap_candidate());
+    fn muted_and_corked_streams_are_not_tapped() {
+        let playable = sample();
+        let muted = StreamSample {
+            muted: true,
+            ..playable.clone()
+        };
         let corked = StreamSample {
             corked: true,
-            ..running.clone()
+            ..playable.clone()
         };
-        let paused = StreamSample {
-            state_running: false,
-            ..running.clone()
-        };
+        assert!(playable.is_tap_candidate());
+        assert!(!muted.is_tap_candidate());
         assert!(!corked.is_tap_candidate());
-        assert!(!paused.is_tap_candidate());
     }
 
     #[test]
@@ -785,53 +805,65 @@ mod tests {
     fn capture_and_communication_streams_are_excluded() {
         let capture = StreamSample {
             media_class: "Stream/Input/Audio".into(),
-            ..sample(true, false, 1.0)
+            ..sample()
         };
         let communication = StreamSample {
             media_role: "Communication".into(),
-            ..sample(true, false, 1.0)
+            ..sample()
         };
         assert!(!capture.is_media_stream());
         assert!(!communication.is_media_stream());
-        assert!(sample(true, false, 1.0).is_media_stream());
+        assert!(sample().is_media_stream());
     }
 
     #[test]
-    fn activity_needs_the_whole_window() {
-        let start = Instant::now();
+    fn both_transitions_require_the_whole_pcm_window() {
         let window = Duration::from_millis(200);
         let mut activity = ActivityWindow::default();
-        assert!(!activity.update(true, start, window));
-        assert!(!activity.update(true, start + Duration::from_millis(100), window));
-        assert!(activity.update(true, start + window, window));
+        for _ in 0..4 {
+            activity.observe(true, window);
+            assert_eq!(activity.confirmed, None);
+        }
+        activity.observe(true, window);
+        assert_eq!(activity.confirmed, Some(true));
+
+        for _ in 0..4 {
+            activity.observe(false, window);
+            assert_eq!(activity.confirmed, Some(true));
+        }
+        activity.observe(false, window);
+        assert_eq!(activity.confirmed, Some(false));
     }
 
     #[test]
-    fn a_dip_resets_the_activity_window() {
-        let start = Instant::now();
+    fn a_brief_reversal_does_not_carry_over() {
         let window = Duration::from_millis(200);
         let mut activity = ActivityWindow::default();
-        assert!(!activity.update(true, start, window));
-        assert!(!activity.update(false, start + Duration::from_millis(100), window));
-        assert!(!activity.update(true, start + Duration::from_millis(150), window));
+        for above in [true, true, true, true, false, true, true, true, true] {
+            activity.observe(above, window);
+            assert_eq!(activity.confirmed, None);
+        }
     }
 
     #[test]
-    fn parses_sink_inputs_with_class_and_role() {
+    fn parses_real_sink_inputs_without_a_state_field() {
         let text = "\
 Sink Input #12
-\tState: RUNNING
 \tCorked: no
 \tMute: no
 \tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 32768 / 50% / -6.02 dB
 \tProperties:
 \t\tmedia.class = \"Stream/Output/Audio\"
 \t\tmedia.role = \"Game\"
+Sink Input #13
+\tCorked: yes
+\tMute: no
 ";
         let samples = parse_sink_inputs(text);
-        assert_eq!(samples.len(), 1);
+        assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].index, 12);
-        assert!(samples[0].state_running);
+        assert!(samples[0].is_tap_candidate());
+        assert!(!samples[1].is_tap_candidate());
         assert!(!samples[0].muted);
         assert!((samples[0].volume - 1.0).abs() < f32::EPSILON);
         assert_eq!(samples[0].media_class, "Stream/Output/Audio");

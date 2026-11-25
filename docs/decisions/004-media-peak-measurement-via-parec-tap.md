@@ -6,23 +6,25 @@ Accepted (2026-11-20)
 
 ## Context
 
-The active-audio rule (FR-016) counts a stream as active only when PipeWire
-reports it RUNNING and its peak stays above the configured threshold (default
--60 dBFS) across the configured window (default 200 ms). Session gain (volume
-and mute state) can only prefilter candidates: an unmuted, digitally-silent
-stream must stay inactive, so the verdict needs the stream's actual sample
-peak. Two mechanisms can read it: the `pipewire` crate as an in-process native
-binding, or a subprocess tap through `parec --monitor-stream`.
+The active-audio rule (FR-016) uses the measured peak of an unmuted, uncorked
+media stream. An eligible stream can still be digitally silent at unity gain.
+Samples can come from the `pipewire` crate's native binding or a subprocess
+tap through `parec --monitor-stream`.
 
 ## Decision
 
-The daemon spawns `parec --monitor-stream=<index> --raw --format=s16le
---rate=48000 --channels=2` per RUNNING playback stream that passes the cheap
-prefilter (uncorked, unmuted, media class), reads the raw samples from the
-subprocess stdout, and computes each window's peak in the daemon as
-`20*log10(max|sample|/32768)`. Taps are capped (four concurrent), reconciled
-with the `pactl list sink-inputs` listing every poll, and killed on drop. The
-`SEUIL_MEDIA_TAP` environment variable names a stub script for hermetic tests.
+The daemon reconciles up to four `parec --monitor-stream=<index>` taps with
+`pactl list sink-inputs` every 100 ms. Each tap requests 48 kHz stereo s16le
+PCM with 40 ms fragments (7,680 bytes), which fit in the 8 KiB pipes measured on
+CachyOS. It computes each fragment's peak as
+`20*log10(max|sample|/32768)`. The configured window (200 ms by default) of
+successive fragments on the same side of the threshold (-60 dBFS by default)
+confirms a transition. Empty reads supply no evidence. Corking, muting, or
+removing a stream drops its tap and its activity. A failed tap holds its
+stream's last verdict and frees its slot while waiting to retry. At the tap
+limit, a tap that delivers no complete fragment in 500 ms also gives up its
+slot. Other taps keep sampling. The `SEUIL_MEDIA_TAP` environment variable
+names a stub script for hermetic tests.
 
 ## Rationale
 
